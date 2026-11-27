@@ -1,4 +1,10 @@
-"""Multipart form parsing for the upload endpoint."""
+"""Multipart form parsing for the upload endpoint.
+
+The parser is deliberately strict: uploaded metadata (especially file names)
+is never trusted for use as a path, boundaries must match what the caller
+declared, and every failure aborts the whole request so that a caller can
+never observe a half-parsed result.
+"""
 
 from __future__ import annotations
 
@@ -54,6 +60,8 @@ def parse_boundary(content_type: str) -> str:
 
 
 def _sniff_boundary(body: Any) -> str | None:
+    """Read the boundary token actually used at the start of ``body``."""
+
     data = _as_bytes(body)
     if not data:
         return None
@@ -69,12 +77,17 @@ def _sniff_boundary(body: Any) -> str | None:
         return None
     try:
         return token.decode("latin-1")
-    except UnicodeDecodeError:
+    except UnicodeDecodeError:  # pragma: no cover - latin-1 cannot fail
         return None
 
 
 def split_parts(body: bytes, boundary: str) -> list[dict[str, Any]]:
-    """Split a multipart body into raw header and payload segments."""
+    """Split a multipart body into raw header and payload segments.
+
+    A body is only accepted when it starts with the opening delimiter and is
+    terminated by a matching closing delimiter with nothing but whitespace
+    after it.  Anything else is malformed and raises.
+    """
 
     data = _as_bytes(body)
     if not isinstance(boundary, str) or not boundary:
@@ -92,14 +105,26 @@ def split_parts(body: bytes, boundary: str) -> list[dict[str, Any]]:
     if not matches or matches[0].start() != 0:
         raise MultipartError("multipart opening boundary is missing")
 
-    parts: list[dict[str, Any]] = []
-
+    closing_index: int | None = None
     for index, match in enumerate(matches):
         if match.group(1) is not None:
+            closing_index = index
+            trailing = data[match.end():]
+            if trailing.strip(b" \t\r\n"):
+                raise MultipartError(
+                    "multipart body has data after the closing boundary"
+                )
             break
 
+    if closing_index is None:
+        raise MultipartError("multipart body is not properly terminated")
+
+    parts: list[dict[str, Any]] = []
+
+    for index in range(closing_index):
+        match = matches[index]
         start = match.end()
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(data)
+        end = matches[index + 1].start()
         segment = data[start:end]
         if segment.endswith(b"\r\n"):
             segment = segment[:-2]
@@ -163,6 +188,8 @@ def _unquote_parameter(value: str) -> str:
 
 
 def _parse_parameters(value: str) -> dict[str, str]:
+    """Parse ``; name=value`` parameters, lower-casing parameter names."""
+
     segments = _split_parameter_segments(value)
     parameters: dict[str, str] = {}
 
@@ -173,7 +200,7 @@ def _parse_parameters(value: str) -> dict[str, str]:
         if "=" not in piece:
             raise MultipartError("malformed header parameter")
         name, raw_value = piece.split("=", 1)
-        name = name.strip()
+        name = name.strip().lower()
         raw_value = raw_value.strip()
         if not name:
             raise MultipartError("empty header parameter name")
@@ -189,7 +216,12 @@ def _parse_parameters(value: str) -> dict[str, str]:
 
 
 def parse_headers(raw: str | bytes) -> dict[str, str]:
-    """Parse one part header block into lower-cased field names."""
+    """Parse one part header block into lower-cased field names.
+
+    Every line must be a well formed ``name: value`` header; parameters of
+    ``Content-Disposition`` are folded in with lower-cased names so that a
+    caller cannot smuggle a ``FileName`` past a ``filename`` check.
+    """
 
     if isinstance(raw, bytes):
         text = raw.decode("latin-1")
@@ -230,82 +262,119 @@ def parse_headers(raw: str | bytes) -> dict[str, str]:
     return headers
 
 
+_SEPARATOR_RE = re.compile(r"[\\/]+")
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
 def safe_filename(name: str | None, policy: dict[str, Any]) -> str:
-    """Create a filesystem-safe name for an uploaded part."""
+    """Create a deterministic, filesystem-safe name for an uploaded part.
+
+    The original name is treated as hostile: path components are stripped,
+    separators and control characters are removed, and the result is always
+    replaced by ``<prefix>-<digest>`` so the caller's chosen name never
+    becomes the on-disk name (and can never escape the upload directory).
+    """
 
     prefix = str(policy.get("filename_prefix", DEFAULT_FILENAME_PREFIX))
     if name is None:
         return ""
 
-    clean = str(name).replace("\x00", "").strip()
-    if not clean:
-        return f"{prefix}-file"
-    if "/" not in clean and "\\" not in clean:
-        return clean
+    clean = _CONTROL_RE.sub("", str(name))
+    base = _SEPARATOR_RE.split(clean)[-1]
+    base = base.strip().strip(".").strip()
 
-    base = clean.rsplit("/", 1)[-1]
-    return f"{prefix}-{base}"
+    digest_source = base.lower()
+    digest = hashlib.sha256(
+        digest_source.encode("utf-8", "surrogatepass")
+    ).hexdigest()[:16]
+    return f"{prefix}-{digest}"
 
 
 def check_limits(parts: list[dict[str, Any]], policy: dict[str, Any]) -> list[str]:
-    """Return policy violations for a parsed part list."""
+    """Return policy violations for a parsed (or raw) part list."""
 
     errors: list[str] = []
+    max_parts = int(policy.get("max_parts", DEFAULT_MAX_PARTS))
     max_part_bytes = int(
         policy.get("max_part_bytes", DEFAULT_MAX_PART_BYTES)
     )
+    max_total_bytes = int(
+        policy.get("max_total_bytes", DEFAULT_MAX_TOTAL_BYTES)
+    )
 
+    if len(parts) > max_parts:
+        errors.append(
+            f"too many parts ({len(parts)} > {max_parts})"
+        )
+
+    total = 0
     for index, part in enumerate(parts):
-        size = len(part.get("body", b""))
+        body = part.get("body", b"")
+        size = len(body)
+        total += size
         if size > max_part_bytes:
             errors.append(
                 f"part {index} exceeds max_part_bytes ({size} > {max_part_bytes})"
             )
 
+    if total > max_total_bytes:
+        errors.append(
+            f"total size exceeds max_total_bytes ({total} > {max_total_bytes})"
+        )
+
     return errors
 
 
 def reject_nested(part: dict[str, Any]) -> bool:
-    """Report whether a part carries a nested multipart payload."""
+    """Report whether a part carries a nested multipart payload.
 
-    content_type = str(part.get("content_type", "")).strip().lower()
-    return content_type.startswith("multipart/")
+    Accepts either a parsed part (``headers``) or a raw ``split_parts``
+    entry (only ``headers_raw``), so nested payloads cannot slip through by
+    being inspected before header parsing.
+    """
+
+    content_type = part.get("content_type")
+    if content_type is None:
+        headers = part.get("headers")
+        if isinstance(headers, dict):
+            content_type = headers.get("content-type")
+    if content_type is None:
+        raw_headers = part.get("headers_raw")
+        if raw_headers is not None:
+            try:
+                content_type = parse_headers(raw_headers).get("content-type")
+            except MultipartError:
+                content_type = None
+
+    value = str(content_type or "").strip().lower()
+    return value.startswith("multipart/")
 
 
 def _parse_with_boundary(
     body: Any, boundary: str, policy: dict[str, Any]
 ) -> dict[str, Any]:
     raw_parts = split_parts(body, boundary)
-    parts: list[dict[str, Any]] = []
-    errors: list[str] = []
 
+    parts: list[dict[str, Any]] = []
     for raw_part in raw_parts:
-        try:
-            headers = parse_headers(raw_part["headers_raw"])
-            raw_name = headers.get("filename")
-            filename = (
-                safe_filename(raw_name, policy) if raw_name is not None else None
-            )
-            part = {
+        headers = parse_headers(raw_part["headers_raw"])
+        content_type = headers.get("content-type")
+        if reject_nested({"headers": headers, "content_type": content_type}):
+            raise MultipartError("nested multipart parts are not allowed")
+
+        raw_name = headers.get("filename")
+        filename = (
+            safe_filename(raw_name, policy) if raw_name is not None else None
+        )
+        parts.append(
+            {
                 "headers": headers,
+                "content_type": content_type,
                 "filename": filename,
                 "body": raw_part["body"],
                 "size": len(raw_part["body"]),
             }
-            if reject_nested(part):
-                raise MultipartError("nested multipart parts are not allowed")
-            parts.append(part)
-        except MultipartError as exc:
-            errors.append(str(exc))
-            break
-
-    if errors:
-        return {
-            "boundary": boundary,
-            "parts": parts,
-            "errors": errors,
-            "ok": False,
-        }
+        )
 
     limit_errors = check_limits(parts, policy)
     if limit_errors:
@@ -321,27 +390,32 @@ def parse_multipart(
 
     boundary = parse_boundary(content_type)
     sniffed = _sniff_boundary(body)
-    if sniffed is not None:
-        boundary = sniffed
+    if sniffed is not None and sniffed != boundary:
+        raise MultipartError(
+            "body boundary does not match the declared content type boundary"
+        )
     return _parse_with_boundary(body, boundary, policy)
 
 
 def multipart_batch(
     requests: list[dict[str, Any]], policy: dict[str, Any]
 ) -> dict[str, Any]:
-    """Parse a batch of independent multipart requests."""
+    """Parse a batch of independent multipart requests.
+
+    Each request is parsed from scratch: no boundary, header or part state is
+    carried from one request to the next.
+    """
 
     results: list[dict[str, Any]] = []
     if not requests:
         return {"results": results}
 
-    cached_boundary = None
     for request in requests:
         try:
-            if cached_boundary is None:
-                cached_boundary = parse_boundary(request.get("content_type", ""))
-            parsed = _parse_with_boundary(
-                request.get("body", b""), cached_boundary, policy
+            parsed = parse_multipart(
+                request.get("body", b""),
+                request.get("content_type", ""),
+                policy,
             )
             results.append({"ok": True, "result": parsed})
         except MultipartError as exc:
